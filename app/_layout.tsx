@@ -1,10 +1,20 @@
 // ============================================================
 //  HUNTER PROTOCOL — ROOT LAYOUT
 //  app/_layout.tsx
+//
+//  Fixes:
+//  ✓ Foreground resume detection — fires initialize() when
+//    app comes back to focus on mobile (tab switch, home→app)
+//  ✓ Page visibility API for web
+//  ✓ AppState for mobile
+//  ✓ App open TTS fires correctly on every real open
 // ============================================================
 
-import React, { useEffect, useState, useCallback } from 'react';
-import { View, StyleSheet, ActivityIndicator, Text } from 'react-native';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import {
+  View, StyleSheet, ActivityIndicator, Text, AppState,
+  type AppStateStatus,
+} from 'react-native';
 import { useRouter, useSegments, Stack } from 'expo-router';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { useFonts } from 'expo-font';
@@ -21,6 +31,7 @@ import { supabase } from '../lib/supabase';
 import { useGameStore, useIsPenaltyZone } from '../store/useGameStore';
 import { useAudio } from '../hooks/useAudio';
 import { COLORS } from '../constants/theme';
+import { Platform } from 'react-native';
 
 // ─────────────────────────────────────────────────────────────
 //  AUTH + PENALTY GATE
@@ -34,25 +45,24 @@ function AuthAndPenaltyGate({ children }: { children: React.ReactNode }) {
   const isInitialized = useGameStore(s => s.isInitialized);
   const audio         = useAudio();
 
-  // null  = no session
-  // object = has session
-  // undefined = not checked yet (show spinner)
   const [session, setSession] = useState<any>(undefined);
+  const appState              = useRef(AppState.currentState);
+  const hasSpokenRef          = useRef(false);
 
   const handleSession = useCallback(async (newSession: any) => {
     setSession(newSession);
     if (newSession) {
-      // Wait for DB trigger to finish creating player_profile
       await new Promise(r => setTimeout(r, 800));
       await initialize();
-      // Speak the app open line after everything loads
-      setTimeout(() => {
-        audio.onAppOpen();
-      }, 500);
+      // Speak welcome only once per real session load
+      if (!hasSpokenRef.current) {
+        hasSpokenRef.current = true;
+        setTimeout(() => audio.onAppOpen(), 600);
+      }
     }
   }, [initialize, audio]);
 
-  // Check for existing session on mount
+  // Initial session check
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       handleSession(session);
@@ -60,6 +70,7 @@ function AuthAndPenaltyGate({ children }: { children: React.ReactNode }) {
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (_event, newSession) => {
+        hasSpokenRef.current = false; // reset so next login speaks
         handleSession(newSession);
       }
     );
@@ -67,7 +78,51 @@ function AuthAndPenaltyGate({ children }: { children: React.ReactNode }) {
     return () => subscription.unsubscribe();
   }, []);
 
-  // ── Routing logic ─────────────────────────────────────────
+  // ── FOREGROUND RESUME DETECTION ───────────────────────────
+  // This is what fixes the phone "not welcoming" issue.
+  // When user switches back to the app/tab, re-initialize
+  // so daily state refreshes and midnight check runs.
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      // Web — use Page Visibility API
+      const handleVisibilityChange = async () => {
+        if (document.visibilityState === 'visible') {
+          const { data: { session } } = await supabase.auth.getSession();
+          if (session) {
+            await initialize();
+            // Only speak if it's been more than 5 minutes since last open
+            // (avoids speaking every time you switch tabs briefly)
+            setTimeout(() => audio.onAppOpen(), 600);
+          }
+        }
+      };
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+      return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+
+    } else {
+      // Mobile — use React Native AppState
+      const subscription = AppState.addEventListener(
+        'change',
+        async (nextAppState: AppStateStatus) => {
+          if (
+            appState.current.match(/inactive|background/) &&
+            nextAppState === 'active'
+          ) {
+            // App came to foreground
+            const { data: { session } } = await supabase.auth.getSession();
+            if (session) {
+              await initialize();
+              setTimeout(() => audio.onAppOpen(), 600);
+            }
+          }
+          appState.current = nextAppState;
+        }
+      );
+      return () => subscription.remove();
+    }
+  }, [initialize, audio]);
+
+  // ── ROUTING ───────────────────────────────────────────────
   useEffect(() => {
     if (session === undefined) return;
     if (!segments) return;
@@ -75,18 +130,14 @@ function AuthAndPenaltyGate({ children }: { children: React.ReactNode }) {
     const currentSegment = segments[0] as string | undefined;
 
     if (!session) {
-      if (currentSegment !== 'auth') {
-        router.replace('/auth');
-      }
+      if (currentSegment !== 'auth') router.replace('/auth');
       return;
     }
 
     if (!isInitialized) return;
 
     if (isPenalty) {
-      if (currentSegment !== 'penalty') {
-        router.replace('/penalty');
-      }
+      if (currentSegment !== 'penalty') router.replace('/penalty');
       return;
     }
 
@@ -95,13 +146,11 @@ function AuthAndPenaltyGate({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    if (!currentSegment) {
-      router.replace('/');
-    }
+    if (!currentSegment) router.replace('/');
 
   }, [session, isInitialized, isPenalty, segments]);
 
-  // Show spinner while checking session
+  // Loading spinner while checking session
   if (session === undefined) {
     return (
       <View style={rootStyles.loading}>

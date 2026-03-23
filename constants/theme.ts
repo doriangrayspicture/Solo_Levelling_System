@@ -1,38 +1,35 @@
 // ============================================================
 //  HUNTER PROTOCOL — DESIGN SYSTEM
 //  constants/theme.ts
-//
-//  Single source of truth for all visual tokens.
-//  Every component imports from here. Never hardcode colors.
 // ============================================================
 
 export const COLORS = {
-  // ── Backgrounds ──────────────────────────────────────────
-  bg:           '#04050A',   // Near-void black — main background
-  bgCard:       '#090C14',   // Card surfaces
-  bgElevated:   '#0E1220',   // Elevated panels, modals
-  bgBorder:     '#151B2E',   // Subtle borders
+  // Backgrounds
+  bg:           '#04050A',
+  bgCard:       '#090C14',
+  bgElevated:   '#0E1220',
+  bgBorder:     '#151B2E',
 
-  // ── Neon Accents ─────────────────────────────────────────
-  neonBlue:     '#00C2FF',   // Primary accent — UI chrome, active states
-  neonPurple:   '#8B5CF6',   // Secondary accent — XP, skill tree
-  neonGreen:    '#00FF94',   // Success, completion states
-  neonRed:      '#FF2D55',   // Penalty zone, danger
-  neonGold:     '#FFD700',   // Boss loot, legendary rarity
-  neonOrange:   '#FF6B00',   // Guild board accent
+  // Neon Accents
+  neonBlue:     '#00C2FF',
+  neonPurple:   '#8B5CF6',
+  neonGreen:    '#00FF94',
+  neonRed:      '#FF2D55',
+  neonGold:     '#FFD700',
+  neonOrange:   '#FF6B00',
 
-  // ── Text ─────────────────────────────────────────────────
-  textPrimary:  '#E8EAF6',   // Main text
-  textSecondary:'#6B7DB3',   // Muted / secondary
-  textDim:      '#2E3A5C',   // Very dim — disabled states
+  // Text
+  textPrimary:  '#E8EAF6',
+  textSecondary:'#6B7DB3',
+  textDim:      '#2E3A5C',
 
-  // ── Rarity Colors ────────────────────────────────────────
+  // Rarity
   rarityCommon:    '#6B7DB3',
   rarityRare:      '#00C2FF',
   rarityEpic:      '#8B5CF6',
   rarityLegendary: '#FFD700',
 
-  // ── Stat Colors (mirrors SystemConfig) ───────────────────
+  // Stat Colors
   statMTech:        '#7C3AED',
   statTechSkill:    '#2563EB',
   statSexyBody:     '#059669',
@@ -42,12 +39,12 @@ export const COLORS = {
   statCharisma:     '#F59E0B',
   statGlobalPolish: '#10B981',
 
-  // ── Penalty Zone ─────────────────────────────────────────
-  penaltyBg:        '#0D0005',
-  penaltyAccent:    '#FF2D55',
-  penaltyGlow:      '#FF003C',
+  // Penalty Zone
+  penaltyBg:     '#0D0005',
+  penaltyAccent: '#FF2D55',
+  penaltyGlow:   '#FF003C',
 
-  // ── Boss Fight ───────────────────────────────────────────
+  // Boss Fight
   bossBg:           '#06000F',
   bossAccentRed:    '#FF2D55',
   bossAccentPurple: '#8B5CF6',
@@ -56,12 +53,10 @@ export const COLORS = {
 } as const;
 
 export const FONTS = {
-  // Display: Orbitron — aggressive, futuristic, military
-  display:     'Orbitron_700Bold',
-  displayMed:  'Orbitron_500Medium',
-  // Body: system monospace — clean, terminal aesthetic
-  body:        'SpaceMono_400Regular',
-  bodyBold:    'SpaceMono_700Bold',
+  display:    'Orbitron_700Bold',
+  displayMed: 'Orbitron_500Medium',
+  body:       'SpaceMono_400Regular',
+  bodyBold:   'SpaceMono_700Bold',
 } as const;
 
 export const SPACING = {
@@ -74,14 +69,13 @@ export const SPACING = {
 } as const;
 
 export const RADIUS = {
-  sm:  6,
-  md:  10,
-  lg:  16,
-  xl:  24,
+  sm:   6,
+  md:   10,
+  lg:   16,
+  xl:   24,
   full: 999,
 } as const;
 
-// Rarity → color mapping used in multiple components
 export const RARITY_COLOR: Record<string, string> = {
   Common:    COLORS.rarityCommon,
   Rare:      COLORS.rarityRare,
@@ -89,7 +83,6 @@ export const RARITY_COLOR: Record<string, string> = {
   Legendary: COLORS.rarityLegendary,
 };
 
-// StatKey → color mapping
 export const STAT_COLOR: Record<string, string> = {
   MTech:        COLORS.statMTech,
   TechSkill:    COLORS.statTechSkill,

@@ -2,18 +2,17 @@
 //  HUNTER PROTOCOL — DASHBOARD SCREEN
 //  app/(tabs)/index.tsx
 //
-//  Fixes:
-//  ✓ Reads completedTaskIdsSet directly from store (not local state)
-//  ✓ Each slice subscribed separately so re-renders are targeted
-//  ✓ completeTask called directly — no intermediate state
-//  ✓ TaskCard uses store selector for completed state
-//  ✓ Side quests use todaySideQuests (daily rotation, not full pool)
+//  New features:
+//  ✓ Live countdown clock to midnight reset
+//  ✓ Auto-reset at midnight without reopening app
+//  ✓ Logout option in header (framed as "go offline")
+//  ✓ All previous reactive state fixes retained
 // ============================================================
 
-import React, { useEffect, useRef, useCallback } from 'react';
+import React, { useEffect, useRef, useCallback, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
-  Animated, RefreshControl, StatusBar,
+  Animated, RefreshControl, StatusBar, Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -31,6 +30,95 @@ import { STAT_DEFINITIONS } from '../../config/SystemConfig';
 import { useAudio } from '../../hooks/useAudio';
 
 // ─────────────────────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────────────────────
+
+function todayDateString(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Returns seconds until next midnight */
+function secondsUntilMidnight(): number {
+  const now       = new Date();
+  const midnight  = new Date(now);
+  midnight.setHours(24, 0, 0, 0);
+  return Math.floor((midnight.getTime() - now.getTime()) / 1000);
+}
+
+/** Format seconds as HH:MM:SS */
+function formatCountdown(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LIVE COUNTDOWN CLOCK
+// ─────────────────────────────────────────────────────────────
+
+function MidnightClock({ onMidnight }: { onMidnight: () => void }) {
+  const [seconds, setSeconds] = useState(secondsUntilMidnight());
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  // Pulse when under 1 hour
+  useEffect(() => {
+    if (seconds < 3600) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 0.6, duration: 800, useNativeDriver: true }),
+          Animated.timing(pulseAnim, { toValue: 1.0, duration: 800, useNativeDriver: true }),
+        ])
+      ).start();
+    } else {
+      pulseAnim.setValue(1);
+    }
+  }, [seconds < 3600]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const remaining = secondsUntilMidnight();
+      setSeconds(remaining);
+
+      // Midnight hit — trigger reset
+      if (remaining <= 0) {
+        onMidnight();
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [onMidnight]);
+
+  const isUrgent  = seconds < 3600;   // under 1 hour — orange
+  const isCritical = seconds < 600;   // under 10 min — red
+
+  const clockColor = isCritical
+    ? COLORS.neonRed
+    : isUrgent
+    ? COLORS.neonOrange
+    : COLORS.neonBlue;
+
+  return (
+    <View style={clockStyles.container}>
+      <Text style={clockStyles.label}>SYSTEM RESET IN</Text>
+      <Animated.Text
+        style={[
+          clockStyles.time,
+          { color: clockColor },
+          { opacity: isUrgent ? pulseAnim : 1 },
+        ]}
+      >
+        {formatCountdown(seconds)}
+      </Animated.Text>
+      {isCritical && (
+        <Text style={clockStyles.warning}>⚠ RESET IMMINENT</Text>
+      )}
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 //  SCANLINE OVERLAY
 // ─────────────────────────────────────────────────────────────
 
@@ -38,18 +126,22 @@ function ScanlineOverlay() {
   const anim = useRef(new Animated.Value(0)).current;
   useEffect(() => {
     Animated.loop(
-      Animated.timing(anim, {
-        toValue: 1, duration: 3000, useNativeDriver: true,
-      })
+      Animated.timing(anim, { toValue: 1, duration: 3000, useNativeDriver: true })
     ).start();
   }, []);
-  const translateY = anim.interpolate({
-    inputRange: [0, 1], outputRange: [-800, 800],
-  });
   return (
     <Animated.View
       pointerEvents="none"
-      style={[styles.scanline, { transform: [{ translateY }] }]}
+      style={[
+        styles.scanline,
+        {
+          transform: [{
+            translateY: anim.interpolate({
+              inputRange: [0, 1], outputRange: [-800, 800],
+            }),
+          }],
+        },
+      ]}
     />
   );
 }
@@ -59,11 +151,12 @@ function ScanlineOverlay() {
 // ─────────────────────────────────────────────────────────────
 
 function StatBar({ statKey, xp }: { statKey: string; xp: number }) {
-  const def = STAT_DEFINITIONS.find(s => s.key === statKey);
+  const def      = STAT_DEFINITIONS.find(s => s.key === statKey);
   if (!def) return null;
   const color    = STAT_COLOR[statKey] ?? COLORS.neonBlue;
   const segments = 10;
   const filled   = Math.min(segments, Math.floor(xp / 100));
+
   return (
     <View style={styles.statRow}>
       <Text style={styles.statIcon}>{def.icon}</Text>
@@ -92,8 +185,6 @@ function StatBar({ statKey, xp }: { statKey: string; xp: number }) {
 
 // ─────────────────────────────────────────────────────────────
 //  TASK CARD
-//  Reads completed state from the store selector directly
-//  so it always reflects the latest optimistic update.
 // ─────────────────────────────────────────────────────────────
 
 function TaskCard({
@@ -107,7 +198,6 @@ function TaskCard({
   disabled?: boolean;
   onComplete: () => void;
 }) {
-  // Each card subscribes to the Set directly — re-renders on every update
   const completedSet = useCompletedTaskIds();
   const completed    = completedSet.has(task.id);
   const scaleAnim    = useRef(new Animated.Value(1)).current;
@@ -134,7 +224,6 @@ function TaskCard({
           disabled  && styles.taskCardDisabled,
         ]}
       >
-        {/* Rarity stripe */}
         <View style={[styles.rarityStripe, { backgroundColor: rarityColor }]} />
 
         <View style={styles.taskCardInner}>
@@ -164,14 +253,11 @@ function TaskCard({
           </View>
 
           {/* Description */}
-          <Text style={[
-            styles.taskDesc,
-            disabled && { color: COLORS.textDim },
-          ]}>
+          <Text style={[styles.taskDesc, disabled && { color: COLORS.textDim }]}>
             {task.description}
           </Text>
 
-          {/* Reward pills */}
+          {/* Rewards */}
           <View style={styles.rewardRow}>
             <View style={styles.rewardPill}>
               <Text style={styles.rewardPillText}>
@@ -208,10 +294,7 @@ function TaskCard({
 function SectionHeader({
   title, subtitle, locked, color,
 }: {
-  title: string;
-  subtitle?: string;
-  locked?: boolean;
-  color?: string;
+  title: string; subtitle?: string; locked?: boolean; color?: string;
 }) {
   return (
     <View style={styles.sectionHeader}>
@@ -220,9 +303,7 @@ function SectionHeader({
         <Text style={[styles.sectionTitle, { color: color ?? COLORS.neonBlue }]}>
           {title}
         </Text>
-        {subtitle ? (
-          <Text style={styles.sectionSubtitle}>{subtitle}</Text>
-        ) : null}
+        {subtitle ? <Text style={styles.sectionSubtitle}>{subtitle}</Text> : null}
       </View>
       {locked && (
         <View style={styles.lockedBadge}>
@@ -237,9 +318,7 @@ function SectionHeader({
 //  BOSS MINI CARD
 // ─────────────────────────────────────────────────────────────
 
-function BossMiniCard({
-  boss, bossState, onPress,
-}: {
+function BossMiniCard({ boss, bossState, onPress }: {
   boss: any; bossState: any; onPress: () => void;
 }) {
   const completedCount = bossState?.completedTaskIds.length ?? 0;
@@ -283,11 +362,33 @@ function BossMiniCard({
       <Text style={[
         styles.bossArrow,
         { color: defeated ? COLORS.neonGreen : COLORS.neonRed },
-      ]}>
-        ›
-      </Text>
+      ]}>›</Text>
     </TouchableOpacity>
   );
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOGOUT CONFIRMATION
+// ─────────────────────────────────────────────────────────────
+
+function useLogout() {
+  const signOut = useGameStore(s => s.signOut);
+
+  return useCallback(() => {
+    Alert.alert(
+      'GO OFFLINE',
+      'The System will remember your progress.\nDisconnect from Hunter Protocol?',
+      [
+        { text: 'STAY ONLINE', style: 'cancel' },
+        {
+          text: 'GO OFFLINE',
+          style: 'destructive',
+          onPress: signOut,
+        },
+      ],
+      { userInterfaceStyle: 'dark' }
+    );
+  }, [signOut]);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -298,28 +399,44 @@ export default function DashboardScreen() {
   const insets   = useSafeAreaInsets();
   const router   = useRouter();
   const audio    = useAudio();
+  const logout   = useLogout();
 
-  // ── Store slices — each subscribed independently ──────────
-  const player          = usePlayer();
-  const levelDef        = useLevelDef();
-  const bossStates      = useBossStates();
-  const completedSet    = useCompletedTaskIds();
-
-  // Subscribe to each daily state value independently
-  // so a change to one doesn't re-render the whole screen
+  // Store slices
+  const player               = usePlayer();
+  const levelDef             = useLevelDef();
+  const bossStates           = useBossStates();
+  const completedSet         = useCompletedTaskIds();
   const completedDailyCount  = useGameStore(s => s.dailyState.completedDailyCount);
   const sideQuestsUnlocked   = useGameStore(s => s.dailyState.sideQuestsUnlocked);
   const guildBoardUnlocked   = useGameStore(s => s.dailyState.guildBoardUnlocked);
   const shopUnlocked         = useGameStore(s => s.dailyState.shopUnlocked);
   const todaySideQuests      = useGameStore(s => s.dailyState.todaySideQuests);
   const todayGuildTasks      = useGameStore(s => s.dailyState.todayGuildTasks);
-  const isLoading            = useGameStore(s => s.isLoading);
+  const completeTask         = useGameStore(s => s.completeTask);
+  const initialize           = useGameStore(s => s.initialize);
 
-  // ── Actions ───────────────────────────────────────────────
-  const completeTask = useGameStore(s => s.completeTask);
-  const initialize   = useGameStore(s => s.initialize);
+  const [refreshing, setRefreshing] = useState(false);
+  const lastDateRef = useRef(todayDateString());
 
-  const [refreshing, setRefreshing] = React.useState(false);
+  // ── MIDNIGHT AUTO-RESET ───────────────────────────────────
+  // Separate from the clock — this is the actual reset trigger
+  const handleMidnight = useCallback(async () => {
+    lastDateRef.current = todayDateString();
+    await initialize();
+  }, [initialize]);
+
+  // Backup date-change check every 60s (catches cases where
+  // the 1s interval drifts slightly past midnight)
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const currentDate = todayDateString();
+      if (currentDate !== lastDateRef.current) {
+        lastDateRef.current = currentDate;
+        await initialize();
+      }
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [initialize]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -337,7 +454,6 @@ export default function DashboardScreen() {
     if (taskType === 'guild_task')  audio.onGuildTaskComplete();
   }, [completeTask, audio]);
 
-  // ── Loading / empty state ─────────────────────────────────
   if (!player || !levelDef) {
     return (
       <View style={styles.centerEmpty}>
@@ -346,8 +462,8 @@ export default function DashboardScreen() {
     );
   }
 
-  const minRequired    = levelDef.dailyMinimumTasks;
-  const progressRatio  = Math.min(1, completedDailyCount / minRequired);
+  const minRequired   = levelDef.dailyMinimumTasks;
+  const progressRatio = Math.min(1, completedDailyCount / minRequired);
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
@@ -378,8 +494,19 @@ export default function DashboardScreen() {
               <Text style={styles.currencyIcon}>◈</Text>
               <Text style={styles.currencyValue}>{player.systemCurrency}</Text>
             </View>
+            {/* Logout — "Go Offline" */}
+            <TouchableOpacity
+              onPress={logout}
+              style={styles.offlineBtn}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.offlineBtnText}>⏻ OFFLINE</Text>
+            </TouchableOpacity>
           </View>
         </View>
+
+        {/* ── COUNTDOWN CLOCK ────────────────────────────── */}
+        <MidnightClock onMidnight={handleMidnight} />
 
         {/* ── DAILY MINIMUM PROGRESS ─────────────────────── */}
         <View style={styles.progressBlock}>
@@ -434,12 +561,10 @@ export default function DashboardScreen() {
                   key={boss.id}
                   boss={boss}
                   bossState={bossState}
-                  onPress={() =>
-                    router.push({
-                      pathname: '/boss',
-                      params:   { bossId: boss.id },
-                    })
-                  }
+                  onPress={() => router.push({
+                    pathname: '/boss',
+                    params:   { bossId: boss.id },
+                  })}
                 />
               );
             })}
@@ -498,7 +623,7 @@ export default function DashboardScreen() {
             locked={!guildBoardUnlocked}
             color={COLORS.neonGold}
           />
-          {guildBoardUnlocked && (
+          {guildBoardUnlocked && todayGuildTasks.length > 0 && (
             <View style={styles.guildBonusBanner}>
               <Text style={styles.guildBonusText}>
                 ◈ GUILD BONUS ACTIVE — UP TO {
@@ -530,392 +655,119 @@ export default function DashboardScreen() {
 
 const COLORS_neonOrange = '#FF6B00';
 
-const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: COLORS.bg,
+const clockStyles = StyleSheet.create({
+  container: {
+    backgroundColor: COLORS.bgCard,
+    borderRadius:    RADIUS.md,
+    borderWidth:     1,
+    borderColor:     COLORS.bgBorder,
+    padding:         SPACING.md,
+    alignItems:      'center',
+    marginBottom:    SPACING.md,
   },
-  scrollContent: {
-    paddingHorizontal: SPACING.md,
-    paddingBottom: SPACING.xxl,
-  },
-  centerEmpty: {
-    flex: 1,
-    backgroundColor: COLORS.bg,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  emptyText: {
-    fontFamily: FONTS.display,
-    color: COLORS.neonBlue,
-    fontSize: 14,
+  label: {
+    fontFamily:    FONTS.display,
+    color:         COLORS.textSecondary,
+    fontSize:      9,
     letterSpacing: 3,
+    marginBottom:  4,
   },
+  time: {
+    fontFamily:    FONTS.display,
+    fontSize:      28,
+    letterSpacing: 4,
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 10,
+  },
+  warning: {
+    fontFamily:    FONTS.display,
+    color:         COLORS.neonRed,
+    fontSize:      9,
+    letterSpacing: 2,
+    marginTop:     4,
+  },
+});
 
-  // Scanline
-  scanline: {
-    position: 'absolute',
-    left: 0, right: 0,
-    height: 2,
-    backgroundColor: COLORS.neonBlue,
-    opacity: 0.04,
-    zIndex: 999,
-    pointerEvents: 'none',
-  },
+const styles = StyleSheet.create({
+  root:            { flex: 1, backgroundColor: COLORS.bg },
+  scrollContent:   { paddingHorizontal: SPACING.md, paddingBottom: SPACING.xxl },
+  centerEmpty:     { flex: 1, backgroundColor: COLORS.bg, justifyContent: 'center', alignItems: 'center' },
+  emptyText:       { fontFamily: FONTS.display, color: COLORS.neonBlue, fontSize: 14, letterSpacing: 3 },
+  scanline:        { position: 'absolute', left: 0, right: 0, height: 2, backgroundColor: COLORS.neonBlue, opacity: 0.04, zIndex: 999, pointerEvents: 'none' },
 
   // Header
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    paddingTop: SPACING.lg,
-    paddingBottom: SPACING.md,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.bgBorder,
-    marginBottom: SPACING.md,
-  },
-  systemLabel: {
-    fontFamily: FONTS.body,
-    color: COLORS.neonBlue,
-    fontSize: 10,
-    letterSpacing: 2,
-    marginBottom: 4,
-  },
-  hunterName: {
-    fontFamily: FONTS.display,
-    color: COLORS.textPrimary,
-    fontSize: 22,
-    letterSpacing: 2,
-  },
-  hunterTitle: {
-    fontFamily: FONTS.body,
-    color: COLORS.neonPurple,
-    fontSize: 11,
-    letterSpacing: 1,
-    marginTop: 2,
-  },
-  headerRight: {
-    alignItems: 'flex-end',
-  },
-  levelBadge: {
-    fontFamily: FONTS.display,
-    color: COLORS.neonBlue,
-    fontSize: 20,
-    letterSpacing: 2,
-  },
-  currencyRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 4,
-  },
-  currencyIcon: {
-    color: COLORS.neonGold,
-    fontSize: 14,
-    marginRight: 4,
-  },
-  currencyValue: {
-    fontFamily: FONTS.bodyBold,
-    color: COLORS.neonGold,
-    fontSize: 16,
-  },
+  header:          { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', paddingTop: SPACING.lg, paddingBottom: SPACING.md, borderBottomWidth: 1, borderBottomColor: COLORS.bgBorder, marginBottom: SPACING.md },
+  systemLabel:     { fontFamily: FONTS.body, color: COLORS.neonBlue, fontSize: 10, letterSpacing: 2, marginBottom: 4 },
+  hunterName:      { fontFamily: FONTS.display, color: COLORS.textPrimary, fontSize: 22, letterSpacing: 2 },
+  hunterTitle:     { fontFamily: FONTS.body, color: COLORS.neonPurple, fontSize: 11, letterSpacing: 1, marginTop: 2 },
+  headerRight:     { alignItems: 'flex-end' },
+  levelBadge:      { fontFamily: FONTS.display, color: COLORS.neonBlue, fontSize: 20, letterSpacing: 2 },
+  currencyRow:     { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
+  currencyIcon:    { color: COLORS.neonGold, fontSize: 14, marginRight: 4 },
+  currencyValue:   { fontFamily: FONTS.bodyBold, color: COLORS.neonGold, fontSize: 16 },
+  offlineBtn:      { marginTop: SPACING.sm, borderWidth: 1, borderColor: COLORS.textDim, borderRadius: RADIUS.sm, paddingHorizontal: SPACING.sm, paddingVertical: 3 },
+  offlineBtnText:  { fontFamily: FONTS.display, color: COLORS.textDim, fontSize: 8, letterSpacing: 1 },
 
-  // Progress bar
-  progressBlock: {
-    marginBottom: SPACING.lg,
-  },
-  progressHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: SPACING.sm,
-  },
-  progressLabel: {
-    fontFamily: FONTS.display,
-    color: COLORS.textSecondary,
-    fontSize: 10,
-    letterSpacing: 3,
-  },
-  progressCount: {
-    fontFamily: FONTS.bodyBold,
-    color: COLORS.neonBlue,
-    fontSize: 11,
-    letterSpacing: 1,
-  },
-  progressTrack: {
-    height: 4,
-    backgroundColor: COLORS.bgBorder,
-    borderRadius: RADIUS.full,
-    overflow: 'hidden',
-  },
-  progressFill: {
-    height: 4,
-    backgroundColor: COLORS.neonBlue,
-    borderRadius: RADIUS.full,
-    shadowColor: COLORS.neonBlue,
-    shadowOpacity: 1,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 0 },
-  },
-  progressFillComplete: {
-    backgroundColor: COLORS.neonGreen,
-    shadowColor: COLORS.neonGreen,
-  },
-  shopUnlockedHint: {
-    fontFamily: FONTS.body,
-    color: COLORS.neonGreen,
-    fontSize: 9,
-    letterSpacing: 1,
-    marginTop: SPACING.sm,
-    textAlign: 'center',
-  },
+  // Progress
+  progressBlock:        { marginBottom: SPACING.md },
+  progressHeader:       { flexDirection: 'row', justifyContent: 'space-between', marginBottom: SPACING.sm },
+  progressLabel:        { fontFamily: FONTS.display, color: COLORS.textSecondary, fontSize: 10, letterSpacing: 3 },
+  progressCount:        { fontFamily: FONTS.bodyBold, color: COLORS.neonBlue, fontSize: 11, letterSpacing: 1 },
+  progressTrack:        { height: 4, backgroundColor: COLORS.bgBorder, borderRadius: RADIUS.full, overflow: 'hidden' },
+  progressFill:         { height: 4, backgroundColor: COLORS.neonBlue, borderRadius: RADIUS.full, shadowColor: COLORS.neonBlue, shadowOpacity: 1, shadowRadius: 6, shadowOffset: { width: 0, height: 0 } },
+  progressFillComplete: { backgroundColor: COLORS.neonGreen, shadowColor: COLORS.neonGreen },
+  shopUnlockedHint:     { fontFamily: FONTS.body, color: COLORS.neonGreen, fontSize: 9, letterSpacing: 1, marginTop: SPACING.sm, textAlign: 'center' },
 
-  // Stat bars
-  statsBlock: {
-    marginBottom: SPACING.lg,
-    backgroundColor: COLORS.bgCard,
-    borderRadius: RADIUS.lg,
-    padding: SPACING.md,
-    borderWidth: 1,
-    borderColor: COLORS.bgBorder,
-  },
-  statRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginVertical: 5,
-  },
-  statIcon: {
-    fontSize: 14,
-    width: 24,
-  },
-  statLabel: {
-    fontFamily: FONTS.display,
-    fontSize: 8,
-    letterSpacing: 1,
-    width: 80,
-  },
-  statBarTrack: {
-    flex: 1,
-    flexDirection: 'row',
-    gap: 2,
-    marginHorizontal: SPACING.sm,
-  },
-  statBarSegment: {
-    flex: 1,
-    height: 6,
-    borderRadius: 2,
-  },
-  statXp: {
-    fontFamily: FONTS.body,
-    color: COLORS.textSecondary,
-    fontSize: 10,
-    width: 36,
-    textAlign: 'right',
-  },
+  // Stats
+  statsBlock:      { marginBottom: SPACING.lg, backgroundColor: COLORS.bgCard, borderRadius: RADIUS.lg, padding: SPACING.md, borderWidth: 1, borderColor: COLORS.bgBorder },
+  statRow:         { flexDirection: 'row', alignItems: 'center', marginVertical: 5 },
+  statIcon:        { fontSize: 14, width: 24 },
+  statLabel:       { fontFamily: FONTS.display, fontSize: 8, letterSpacing: 1, width: 80 },
+  statBarTrack:    { flex: 1, flexDirection: 'row', gap: 2, marginHorizontal: SPACING.sm },
+  statBarSegment:  { flex: 1, height: 6, borderRadius: 2 },
+  statXp:          { fontFamily: FONTS.body, color: COLORS.textSecondary, fontSize: 10, width: 36, textAlign: 'right' },
 
   // Sections
-  section: {
-    marginBottom: SPACING.lg,
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: SPACING.md,
-    gap: SPACING.sm,
-  },
-  sectionLine: {
-    width: 3,
-    height: 24,
-    borderRadius: 2,
-  },
-  sectionTitle: {
-    fontFamily: FONTS.display,
-    fontSize: 12,
-    letterSpacing: 3,
-  },
-  sectionSubtitle: {
-    fontFamily: FONTS.body,
-    color: COLORS.textSecondary,
-    fontSize: 10,
-    marginTop: 2,
-  },
-  lockedBadge: {
-    marginLeft: 'auto' as any,
-    backgroundColor: COLORS.bgBorder,
-    paddingHorizontal: SPACING.sm,
-    paddingVertical: 3,
-    borderRadius: RADIUS.sm,
-  },
-  lockedBadgeText: {
-    fontFamily: FONTS.body,
-    color: COLORS.textSecondary,
-    fontSize: 9,
-    letterSpacing: 1,
-  },
+  section:         { marginBottom: SPACING.lg },
+  sectionHeader:   { flexDirection: 'row', alignItems: 'center', marginBottom: SPACING.md, gap: SPACING.sm },
+  sectionLine:     { width: 3, height: 24, borderRadius: 2 },
+  sectionTitle:    { fontFamily: FONTS.display, fontSize: 12, letterSpacing: 3 },
+  sectionSubtitle: { fontFamily: FONTS.body, color: COLORS.textSecondary, fontSize: 10, marginTop: 2 },
+  lockedBadge:     { marginLeft: 'auto' as any, backgroundColor: COLORS.bgBorder, paddingHorizontal: SPACING.sm, paddingVertical: 3, borderRadius: RADIUS.sm },
+  lockedBadgeText: { fontFamily: FONTS.body, color: COLORS.textSecondary, fontSize: 9, letterSpacing: 1 },
 
   // Task cards
-  taskCard: {
-    backgroundColor: COLORS.bgCard,
-    borderRadius: RADIUS.md,
-    borderWidth: 1,
-    marginBottom: SPACING.sm,
-    overflow: 'hidden',
-    flexDirection: 'row',
-  },
-  taskCardCompleted: {
-    backgroundColor: '#040D0A',
-  },
-  taskCardDisabled: {
-    opacity: 0.35,
-  },
-  rarityStripe: {
-    width: 3,
-    alignSelf: 'stretch',
-  },
-  taskCardInner: {
-    flex: 1,
-    padding: SPACING.md,
-  },
-  taskCardHeader: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    marginBottom: SPACING.sm,
-  },
-  taskIcon: {
-    fontSize: 18,
-    marginRight: SPACING.sm,
-    marginTop: 2,
-  },
-  taskCardTitles: {
-    flex: 1,
-  },
-  taskName: {
-    fontFamily: FONTS.display,
-    color: COLORS.textPrimary,
-    fontSize: 11,
-    letterSpacing: 1,
-    lineHeight: 16,
-  },
-  taskMeta: {
-    flexDirection: 'row',
-    marginTop: 4,
-  },
-  rarityBadge: {
-    fontFamily: FONTS.body,
-    fontSize: 9,
-    letterSpacing: 1,
-  },
-  taskTime: {
-    fontFamily: FONTS.body,
-    color: COLORS.textSecondary,
-    fontSize: 9,
-  },
-  completedBadge: {
-    width: 28,
-    height: 28,
-    borderRadius: RADIUS.full,
-    backgroundColor: COLORS.neonGreen,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginLeft: SPACING.sm,
-    shadowColor: COLORS.neonGreen,
-    shadowOpacity: 0.8,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 0 },
-  },
-  completedCheck: {
-    color: COLORS.bg,
-    fontSize: 14,
-    fontWeight: 'bold',
-  },
-  taskDesc: {
-    fontFamily: FONTS.body,
-    color: COLORS.textSecondary,
-    fontSize: 10,
-    lineHeight: 16,
-    marginBottom: SPACING.sm,
-  },
-  rewardRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-  },
-  rewardPill: {
-    borderWidth: 1,
-    borderColor: COLORS.neonGold,
-    borderRadius: RADIUS.sm,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-  },
-  rewardPillText: {
-    fontFamily: FONTS.body,
-    color: COLORS.neonGold,
-    fontSize: 9,
-    letterSpacing: 0.5,
-  },
+  taskCard:         { backgroundColor: COLORS.bgCard, borderRadius: RADIUS.md, borderWidth: 1, marginBottom: SPACING.sm, overflow: 'hidden', flexDirection: 'row' },
+  taskCardCompleted:{ backgroundColor: '#040D0A' },
+  taskCardDisabled: { opacity: 0.35 },
+  rarityStripe:     { width: 3, alignSelf: 'stretch' },
+  taskCardInner:    { flex: 1, padding: SPACING.md },
+  taskCardHeader:   { flexDirection: 'row', alignItems: 'flex-start', marginBottom: SPACING.sm },
+  taskIcon:         { fontSize: 18, marginRight: SPACING.sm, marginTop: 2 },
+  taskCardTitles:   { flex: 1 },
+  taskName:         { fontFamily: FONTS.display, color: COLORS.textPrimary, fontSize: 11, letterSpacing: 1, lineHeight: 16 },
+  taskMeta:         { flexDirection: 'row', marginTop: 4 },
+  rarityBadge:      { fontFamily: FONTS.body, fontSize: 9, letterSpacing: 1 },
+  taskTime:         { fontFamily: FONTS.body, color: COLORS.textSecondary, fontSize: 9 },
+  completedBadge:   { width: 28, height: 28, borderRadius: RADIUS.full, backgroundColor: COLORS.neonGreen, justifyContent: 'center', alignItems: 'center', marginLeft: SPACING.sm, shadowColor: COLORS.neonGreen, shadowOpacity: 0.8, shadowRadius: 8, shadowOffset: { width: 0, height: 0 } },
+  completedCheck:   { color: COLORS.bg, fontSize: 14, fontWeight: 'bold' },
+  taskDesc:         { fontFamily: FONTS.body, color: COLORS.textSecondary, fontSize: 10, lineHeight: 16, marginBottom: SPACING.sm },
+  rewardRow:        { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  rewardPill:       { borderWidth: 1, borderColor: COLORS.neonGold, borderRadius: RADIUS.sm, paddingHorizontal: 8, paddingVertical: 2 },
+  rewardPillText:   { fontFamily: FONTS.body, color: COLORS.neonGold, fontSize: 9, letterSpacing: 0.5 },
 
-  // Boss mini card
-  bossCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: COLORS.bgCard,
-    borderRadius: RADIUS.md,
-    borderWidth: 1,
-    padding: SPACING.md,
-    marginBottom: SPACING.sm,
-  },
-  bossCardIcon: {
-    fontSize: 32,
-    marginRight: SPACING.md,
-  },
-  bossCardInfo: {
-    flex: 1,
-  },
-  bossCardName: {
-    fontFamily: FONTS.display,
-    fontSize: 13,
-    letterSpacing: 2,
-  },
-  bossCardTitle: {
-    fontFamily: FONTS.body,
-    color: COLORS.textSecondary,
-    fontSize: 9,
-    marginBottom: SPACING.sm,
-  },
-  bossHpTrack: {
-    height: 6,
-    backgroundColor: COLORS.bgBorder,
-    borderRadius: RADIUS.full,
-    overflow: 'hidden',
-    marginBottom: 4,
-  },
-  bossHpFill: {
-    height: 6,
-    borderRadius: RADIUS.full,
-  },
-  bossProgressText: {
-    fontFamily: FONTS.body,
-    color: COLORS.textSecondary,
-    fontSize: 9,
-    letterSpacing: 0.5,
-  },
-  bossArrow: {
-    fontSize: 24,
-    marginLeft: SPACING.sm,
-  },
+  // Boss card
+  bossCard:         { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.bgCard, borderRadius: RADIUS.md, borderWidth: 1, padding: SPACING.md, marginBottom: SPACING.sm },
+  bossCardIcon:     { fontSize: 32, marginRight: SPACING.md },
+  bossCardInfo:     { flex: 1 },
+  bossCardName:     { fontFamily: FONTS.display, fontSize: 13, letterSpacing: 2 },
+  bossCardTitle:    { fontFamily: FONTS.body, color: COLORS.textSecondary, fontSize: 9, marginBottom: SPACING.sm },
+  bossHpTrack:      { height: 6, backgroundColor: COLORS.bgBorder, borderRadius: RADIUS.full, overflow: 'hidden', marginBottom: 4 },
+  bossHpFill:       { height: 6, borderRadius: RADIUS.full },
+  bossProgressText: { fontFamily: FONTS.body, color: COLORS.textSecondary, fontSize: 9, letterSpacing: 0.5 },
+  bossArrow:        { fontSize: 24, marginLeft: SPACING.sm },
 
   // Guild board
-  guildBonusBanner: {
-    backgroundColor: '#1A1200',
-    borderRadius: RADIUS.md,
-    borderWidth: 1,
-    borderColor: COLORS.neonGold,
-    padding: SPACING.md,
-    alignItems: 'center',
-    marginBottom: SPACING.sm,
-  },
-  guildBonusText: {
-    fontFamily: FONTS.display,
-    color: COLORS.neonGold,
-    fontSize: 10,
-    letterSpacing: 2,
-  },
+  guildBonusBanner: { backgroundColor: '#1A1200', borderRadius: RADIUS.md, borderWidth: 1, borderColor: COLORS.neonGold, padding: SPACING.md, alignItems: 'center', marginBottom: SPACING.sm },
+  guildBonusText:   { fontFamily: FONTS.display, color: COLORS.neonGold, fontSize: 10, letterSpacing: 2 },
 });
