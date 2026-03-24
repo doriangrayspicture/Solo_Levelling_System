@@ -1,15 +1,14 @@
 // ============================================================
 //  HUNTER PROTOCOL — GAME LOGIC ENGINE
-//  store/useGameStore.ts  —  v3
+//  store/useGameStore.ts  —  v4
 //
-//  Root cause fixes:
-//  ✓ completedTaskIds now always a NEW Set on every update
-//    so Zustand detects the change and triggers re-renders
-//  ✓ Optimistic update fires BEFORE Supabase write on all tiers
-//  ✓ Penalty step progress updates optimistically and reactively
-//  ✓ New player guard uses .lt('completed_date', today) so
-//    genuinely skipped days still trigger penalty correctly
-//  ✓ All error paths surface to console so silent failures stop
+//  Fixes:
+//  ✓ Penalty zone re-trigger on reload fixed:
+//    runMidnightCheck now skips if penalty was ALREADY escaped
+//    today (checks today's penalty completion in daily_task_log)
+//  ✓ New player guard uses .lt() so only prior days count
+//  ✓ Skipped day correctly triggers penalty (yesterdayCount = 0)
+//  ✓ All previous fixes retained
 // ============================================================
 
 import { create } from 'zustand';
@@ -57,8 +56,6 @@ export interface PlayerProfile {
 }
 
 export interface DailyState {
-  // Plain array — Zustand detects array replacement correctly.
-  // Use completedTaskIdsSet for O(1) lookups in the UI.
   completedTaskIds:    string[];
   completedTaskIdsSet: Set<string>;
   completedDailyCount: number;
@@ -158,7 +155,10 @@ function yesterdayDateString(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function getXpMultiplier(boosts: PlayerProfile['activeBoosts'], stat: StatKey): number {
+function getXpMultiplier(
+  boosts: PlayerProfile['activeBoosts'],
+  stat: StatKey
+): number {
   const boost = (boosts as any)[stat] as ActiveBoost | undefined;
   if (!boost || new Date(boost.expiresAt) < new Date()) return 1.0;
   return boost.multiplier;
@@ -196,7 +196,6 @@ function emptyDailyState(level: number): DailyState {
   };
 }
 
-/** Build a fresh DailyState from a list of completed task rows */
 function buildDailyState(
   rows: { task_id: string; task_type: string }[],
   level: number,
@@ -247,13 +246,14 @@ export const useGameStore = create<GameStore>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
+        email, password,
         options: { data: { hunter_name: hunterName } },
       });
       if (error) throw error;
       if (!data.session) {
-        const { error: siErr } = await supabase.auth.signInWithPassword({ email, password });
+        const { error: siErr } = await supabase.auth.signInWithPassword({
+          email, password,
+        });
         if (siErr) throw siErr;
       }
     } catch (e: any) {
@@ -267,7 +267,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
   signIn: async (email, password) => {
     set({ isLoading: true, error: null });
     try {
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      const { error } = await supabase.auth.signInWithPassword({
+        email, password,
+      });
       if (error) throw error;
     } catch (e: any) {
       console.error('[signIn]', e.message);
@@ -356,7 +358,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
       if (player.isInPenaltyZone) {
         activePenaltyQuest =
           (player.activePenaltyQuestId
-            ? levelDef?.penaltyQuests.find(p => p.id === player.activePenaltyQuestId)
+            ? levelDef?.penaltyQuests.find(
+                p => p.id === player.activePenaltyQuestId
+              )
             : undefined) ??
           getRandomPenaltyQuest(player.currentLevel) ??
           null;
@@ -383,9 +387,6 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   // ─────────────────────────────────────────────────────────
   //  REFRESH DAILY STATE
-  //  Always creates a completely NEW DailyState object and a
-  //  NEW Set so Zustand's shallow comparison detects the change
-  //  and triggers re-renders in all subscribed components.
   // ─────────────────────────────────────────────────────────
 
   _refreshDailyState: async () => {
@@ -413,69 +414,46 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   // ─────────────────────────────────────────────────────────
   //  COMPLETE TASK
-  //  Order of operations:
-  //  1. Gate checks (prevent double completion, enforce unlocks)
-  //  2. Calculate rewards from config
-  //  3. OPTIMISTIC UPDATE — UI responds immediately
-  //  4. Write to Supabase
-  //  5. Refresh daily state from DB (confirms and syncs)
-  //  6. Check boss progress
-  //  7. Check level up
   // ─────────────────────────────────────────────────────────
 
   completeTask: async (taskId, taskType) => {
     const { player, dailyState, currentLevelDef } = get();
     if (!player || !currentLevelDef) return;
 
-    // Gate 1 — already completed today
-    if (dailyState.completedTaskIdsSet.has(taskId)) {
-      console.log('[completeTask] already done:', taskId);
-      return;
-    }
-
-    // Gate 2 — tier locks
-    if (taskType === 'side_quest' && !dailyState.sideQuestsUnlocked) {
-      console.log('[completeTask] side quests locked');
-      return;
-    }
-    if (taskType === 'guild_task' && !dailyState.guildBoardUnlocked) {
-      console.log('[completeTask] guild board locked');
-      return;
-    }
+    if (dailyState.completedTaskIdsSet.has(taskId)) return;
+    if (taskType === 'side_quest' && !dailyState.sideQuestsUnlocked) return;
+    if (taskType === 'guild_task' && !dailyState.guildBoardUnlocked) return;
 
     console.log('[completeTask] starting:', taskId, taskType);
     set({ isLoading: true, error: null });
 
     try {
-      // Resolve task from config
       let statRewards:    { stat: StatKey; xp: number }[] = [];
       let baseCurrency    = 0;
       let guildMultiplier = 1.0;
 
       if (taskType === 'daily') {
         const task = currentLevelDef.dailyTasks.find(t => t.id === taskId);
-        if (!task) throw new Error(`Task not found in config: ${taskId}`);
+        if (!task) throw new Error(`Task not found: ${taskId}`);
         statRewards  = task.statRewards;
         baseCurrency = task.currencyReward;
-
       } else if (taskType === 'side_quest') {
         const sq = dailyState.todaySideQuests.find(s => s.id === taskId);
-        if (!sq) throw new Error(`Side quest not in today's rotation: ${taskId}`);
+        if (!sq) throw new Error(`Side quest not in rotation: ${taskId}`);
         statRewards  = sq.statRewards;
         baseCurrency = sq.currencyReward;
-
       } else if (taskType === 'guild_task') {
         const gt = dailyState.todayGuildTasks.find(g => g.id === taskId);
-        if (!gt) throw new Error(`Guild task not in today's rotation: ${taskId}`);
+        if (!gt) throw new Error(`Guild task not in rotation: ${taskId}`);
         statRewards     = gt.statRewards;
         baseCurrency    = gt.currencyReward;
         guildMultiplier = gt.guildBonusMultiplier;
       }
 
-      // Calculate rewards
       const currencyMult  = getCurrencyMultiplier(player.activeBoosts);
       const finalCurrency = Math.round(
-        baseCurrency * guildMultiplier * currencyMult * SYSTEM_META.baseCurrencyMultiplier
+        baseCurrency * guildMultiplier * currencyMult *
+        SYSTEM_META.baseCurrencyMultiplier
       );
 
       const xpUpdates:  Partial<Record<StatKey, number>> = {};
@@ -503,18 +481,15 @@ export const useGameStore = create<GameStore>((set, get) => ({
         newStatXp[stat as StatKey] = newVal;
       }
 
-      // ── OPTIMISTIC UPDATE ──────────────────────────────────
-      // Fires BEFORE Supabase write so the UI responds instantly.
-      // Creates a completely new DailyState object with a new Set
-      // so Zustand detects the change via shallow comparison.
-      const newCompletedIds    = [...dailyState.completedTaskIds, taskId];
-      const newCompletedSet    = new Set<string>(newCompletedIds);
-      const newDailyCount      = taskType === 'daily'
+      // Optimistic update — UI responds instantly
+      const newCompletedIds  = [...dailyState.completedTaskIds, taskId];
+      const newCompletedSet  = new Set<string>(newCompletedIds);
+      const newDailyCount    = taskType === 'daily'
         ? dailyState.completedDailyCount + 1
         : dailyState.completedDailyCount;
-      const min                = currentLevelDef.dailyMinimumTasks;
-      const newSQUnlocked      = newDailyCount >= min;
-      const newSQComplete      = newSQUnlocked &&
+      const min              = currentLevelDef.dailyMinimumTasks;
+      const newSQUnlocked    = newDailyCount >= min;
+      const newSQComplete    = newSQUnlocked &&
         dailyState.todaySideQuests.every(sq => newCompletedSet.has(sq.id));
 
       set(s => ({
@@ -535,7 +510,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
         },
       }));
 
-      // ── WRITE TO SUPABASE ──────────────────────────────────
+      // Write to Supabase
       const { error: profileError } = await supabase
         .from('player_profile')
         .update({ ...statCols, system_currency: newCurrency })
@@ -576,18 +551,15 @@ export const useGameStore = create<GameStore>((set, get) => ({
         balance_after:    newCurrency,
       });
 
-      console.log('[completeTask] success:', taskId, '| currency earned:', finalCurrency);
+      console.log('[completeTask] success:', taskId, '| currency:', finalCurrency);
 
-      // Sync with DB to confirm state
       await get()._refreshDailyState();
-
       if (taskType === 'daily') await get()._checkBossProgress(taskId);
       await get()._checkLevelUp();
 
     } catch (e: any) {
       console.error('[completeTask] error:', e.message);
       set({ error: e.message });
-      // Revert optimistic update on failure
       await get()._refreshDailyState();
     } finally {
       set({ isLoading: false });
@@ -596,8 +568,6 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   // ─────────────────────────────────────────────────────────
   //  COMPLETE PENALTY STEP
-  //  Optimistic update fires first so checkmark appears instantly.
-  //  Progress array falls back to config shape if DB returned empty.
   // ─────────────────────────────────────────────────────────
 
   completePenaltyStep: async (taskId) => {
@@ -605,17 +575,17 @@ export const useGameStore = create<GameStore>((set, get) => ({
     if (!player || !currentLevelDef || !player.isInPenaltyZone) return;
     if (!activePenaltyQuest) return;
 
-    // Build progress — fall back to config if DB returned empty
     const currentProgress =
       player.penaltyQuestProgress.length > 0
         ? [...player.penaltyQuestProgress]
-        : activePenaltyQuest.tasks.map(t => ({ taskId: t.taskId, completed: false }));
+        : activePenaltyQuest.tasks.map(t => ({
+            taskId:    t.taskId,
+            completed: false,
+          }));
 
-    // Check if this step is already done
     const existing = currentProgress.find(s => s.taskId === taskId);
     if (existing?.completed) return;
 
-    // Mark step complete
     const stepIndex = currentProgress.findIndex(s => s.taskId === taskId);
     if (stepIndex === -1) {
       currentProgress.push({ taskId, completed: true });
@@ -623,7 +593,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
       currentProgress[stepIndex] = { taskId, completed: true };
     }
 
-    // ── OPTIMISTIC UPDATE — checkmark appears instantly ────
+    // Optimistic update
     set(s => ({
       player: s.player ? {
         ...s.player,
@@ -634,7 +604,6 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const allComplete = currentProgress.every(s => s.completed);
 
     if (allComplete) {
-      // ── ESCAPE ──────────────────────────────────────────
       const { currencyBonus, statBonuses } = activePenaltyQuest.escapeReward;
       const newCurrency = player.systemCurrency + currencyBonus;
       const newStatXp   = { ...player.statXp };
@@ -655,6 +624,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
         active_penalty_quest_id: null,
       }).eq('id', player.id);
 
+      // Log penalty completion so midnight check knows it was cleared today
       await supabase.from('daily_task_log').insert({
         player_id:       player.id,
         task_id:         activePenaltyQuest.id,
@@ -688,7 +658,6 @@ export const useGameStore = create<GameStore>((set, get) => ({
       await get()._refreshDailyState();
 
     } else {
-      // Save partial progress
       await supabase.from('player_profile').update({
         penalty_quest_progress: currentProgress,
       }).eq('id', player.id);
@@ -712,7 +681,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
       if (updated[idx].completedTaskIds.includes(taskId)) continue;
 
       const newCompleted = [...updated[idx].completedTaskIds, taskId];
-      const isDefeated   = boss.requiredTaskIds.every(id => newCompleted.includes(id));
+      const isDefeated   = boss.requiredTaskIds.every(
+        id => newCompleted.includes(id)
+      );
       const payload: any = { completed_task_ids: newCompleted };
       if (isDefeated) {
         payload.status      = 'defeated';
@@ -790,7 +761,10 @@ export const useGameStore = create<GameStore>((set, get) => ({
           statXp:             newStatXp,
           systemCurrency:     newCurrency,
           currentTitle:       rewards.titleUnlock ?? s.player!.currentTitle,
-          unlockedSkillNodes: [...s.player!.unlockedSkillNodes, rewards.lootNodeId],
+          unlockedSkillNodes: [
+            ...s.player!.unlockedSkillNodes,
+            rewards.lootNodeId,
+          ],
         } : null,
         bossStates: s.bossStates.map(b =>
           b.bossId === bossId ? { ...b, lootClaimed: true } : b
@@ -839,7 +813,8 @@ export const useGameStore = create<GameStore>((set, get) => ({
         player_id:           player.id,
         from_level:          player.currentLevel,
         to_level:            nextLevel,
-        total_xp_at_levelup: Object.values(player.statXp).reduce((a, b) => a + b, 0),
+        total_xp_at_levelup: Object.values(player.statXp)
+          .reduce((a, b) => a + b, 0),
       });
 
       await supabase.from('currency_log').insert({
@@ -876,7 +851,8 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   purchaseShopItem: async (item) => {
     const { player, dailyState } = get();
-    if (!player || !dailyState.shopUnlocked || player.systemCurrency < item.cost) return;
+    if (!player || !dailyState.shopUnlocked || player.systemCurrency < item.cost)
+      return;
 
     set({ isLoading: true, error: null });
     try {
@@ -885,19 +861,26 @@ export const useGameStore = create<GameStore>((set, get) => ({
       let expiresAt: string | null = null;
 
       if (item.effect.type === 'xpMultiplier') {
-        expiresAt = new Date(Date.now() + item.effect.durationHours * 3600000).toISOString();
+        expiresAt = new Date(
+          Date.now() + item.effect.durationHours * 3600000
+        ).toISOString();
         profileUpdate.active_boosts = {
           ...player.activeBoosts,
           [item.effect.stat]: { multiplier: item.effect.multiplier, expiresAt },
         };
       } else if (item.effect.type === 'currencyBoost') {
-        expiresAt = new Date(Date.now() + item.effect.durationHours * 3600000).toISOString();
+        expiresAt = new Date(
+          Date.now() + item.effect.durationHours * 3600000
+        ).toISOString();
         profileUpdate.active_boosts = {
           ...player.activeBoosts,
           currency: { multiplier: item.effect.multiplier, expiresAt },
         };
       } else if (item.effect.type === 'unlockCosmetic') {
-        profileUpdate.unlocked_cosmetics = [...player.unlockedCosmetics, item.effect.cosmeticId];
+        profileUpdate.unlocked_cosmetics = [
+          ...player.unlockedCosmetics,
+          item.effect.cosmeticId,
+        ];
       } else if (item.effect.type === 'restorePenalty') {
         profileUpdate.is_in_penalty_zone      = false;
         profileUpdate.penalty_activated_at    = null;
@@ -905,7 +888,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
         profileUpdate.active_penalty_quest_id = null;
       }
 
-      await supabase.from('player_profile').update(profileUpdate).eq('id', player.id);
+      await supabase.from('player_profile')
+        .update(profileUpdate)
+        .eq('id', player.id);
 
       await supabase.from('shop_purchase_log').insert({
         player_id:       player.id,
@@ -927,11 +912,23 @@ export const useGameStore = create<GameStore>((set, get) => ({
         if (!s.player) return {};
         const p = { ...s.player, systemCurrency: newCurrency };
         if (item.effect.type === 'xpMultiplier') {
-          p.activeBoosts = { ...s.player.activeBoosts, [item.effect.stat]: { multiplier: item.effect.multiplier, expiresAt: expiresAt! } };
+          p.activeBoosts = {
+            ...s.player.activeBoosts,
+            [item.effect.stat]: {
+              multiplier: item.effect.multiplier,
+              expiresAt:  expiresAt!,
+            },
+          };
         } else if (item.effect.type === 'currencyBoost') {
-          p.activeBoosts = { ...s.player.activeBoosts, currency: { multiplier: item.effect.multiplier, expiresAt: expiresAt! } };
+          p.activeBoosts = {
+            ...s.player.activeBoosts,
+            currency: { multiplier: item.effect.multiplier, expiresAt: expiresAt! },
+          };
         } else if (item.effect.type === 'unlockCosmetic') {
-          p.unlockedCosmetics = [...s.player.unlockedCosmetics, item.effect.cosmeticId];
+          p.unlockedCosmetics = [
+            ...s.player.unlockedCosmetics,
+            item.effect.cosmeticId,
+          ];
         } else if (item.effect.type === 'restorePenalty') {
           p.isInPenaltyZone      = false;
           p.penaltyActivatedAt   = null;
@@ -940,7 +937,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
         }
         return {
           player:             p,
-          activePenaltyQuest: item.effect.type === 'restorePenalty' ? null : s.activePenaltyQuest,
+          activePenaltyQuest: item.effect.type === 'restorePenalty'
+            ? null
+            : s.activePenaltyQuest,
         };
       });
 
@@ -955,27 +954,41 @@ export const useGameStore = create<GameStore>((set, get) => ({
   // ─────────────────────────────────────────────────────────
   //  MIDNIGHT CHECK
   //
-  //  Guard logic (in order):
-  //  1. Already in penalty zone → skip
-  //  2. No daily task history before today → new player, skip
-  //     Uses .lt('completed_date', today) so only tasks on
-  //     previous days count — joining mid-day is protected.
-  //  3. Yesterday count < minimum → penalize
-  //     yesterdayCount = 0 means they skipped entirely → penalize
-  //     yesterdayCount < min means partial → penalize
-  //     This correctly catches genuine missed days.
+  //  Guard order:
+  //  1. Already in penalty zone → skip (already punished)
+  //  2. Escaped penalty today → skip
+  //     THE KEY FIX: if player completed a penalty quest
+  //     today, don't re-trigger even if yesterday had 0 tasks.
+  //     This stops the reload loop after escaping.
+  //  3. No daily history before today → new player, skip
+  //  4. Yesterday count < minimum → penalize
   // ─────────────────────────────────────────────────────────
 
   runMidnightCheck: async () => {
     const { player, currentLevelDef } = get();
     if (!player || !currentLevelDef) return;
 
-    // Guard 1
+    // Guard 1 — already in penalty zone
     if (player.isInPenaltyZone) return;
 
     const today = todayDateString();
 
-    // Guard 2 — check for daily task history on any day BEFORE today
+    // Guard 2 — THE CRITICAL FIX
+    // Check if penalty was escaped today (penalty task logged today)
+    // If yes, skip — player already paid their debt today
+    const { count: penaltyEscapedToday } = await supabase
+      .from('daily_task_log')
+      .select('id', { count: 'exact', head: true })
+      .eq('player_id', player.id)
+      .eq('task_type', 'penalty')
+      .eq('completed_date', today);
+
+    if (penaltyEscapedToday && penaltyEscapedToday > 0) {
+      console.log('[midnightCheck] penalty escaped today — skipping re-trigger');
+      return;
+    }
+
+    // Guard 3 — new player with no prior daily history
     const { count: historyBeforeToday } = await supabase
       .from('daily_task_log')
       .select('id', { count: 'exact', head: true })
@@ -988,7 +1001,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
       return;
     }
 
-    // Guard 3 — check yesterday's daily count
+    // Guard 4 — check yesterday's daily count
     const { count: yesterdayCount } = await supabase
       .from('daily_task_log')
       .select('id', { count: 'exact', head: true })
@@ -996,7 +1009,12 @@ export const useGameStore = create<GameStore>((set, get) => ({
       .eq('completed_date', yesterdayDateString())
       .eq('task_type', 'daily');
 
-    console.log('[midnightCheck] yesterday daily count:', yesterdayCount, '| minimum:', currentLevelDef.dailyMinimumTasks);
+    console.log(
+      '[midnightCheck] yesterday:',
+      yesterdayCount,
+      '| min:',
+      currentLevelDef.dailyMinimumTasks
+    );
 
     if ((yesterdayCount ?? 0) < currentLevelDef.dailyMinimumTasks) {
       await get()._triggerPenaltyZone();
@@ -1046,18 +1064,20 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
 // ─────────────────────────────────────────────────────────────
 //  SELECTOR HOOKS
-//  Each subscribes to only the slice it needs.
-//  completedTaskIdsSet exposed separately for O(1) has() lookups.
 // ─────────────────────────────────────────────────────────────
 
-export const usePlayer             = () => useGameStore(s => s.player);
-export const useDailyState         = () => useGameStore(s => s.dailyState);
-export const useBossStates         = () => useGameStore(s => s.bossStates);
-export const useLevelDef           = () => useGameStore(s => s.currentLevelDef);
-export const useIsPenaltyZone      = () => useGameStore(s => s.player?.isInPenaltyZone ?? false);
-export const useShopUnlocked       = () => useGameStore(s => s.dailyState.shopUnlocked);
-export const useIsLoading          = () => useGameStore(s => s.isLoading);
-export const useError              = () => useGameStore(s => s.error);
-export const useActivePenalty      = () => useGameStore(s => s.activePenaltyQuest);
-export const useCompletedTaskIds   = () => useGameStore(s => s.dailyState.completedTaskIdsSet);
-export const usePenaltyProgress    = () => useGameStore(s => s.player?.penaltyQuestProgress ?? []);
+export const usePlayer           = () => useGameStore(s => s.player);
+export const useDailyState       = () => useGameStore(s => s.dailyState);
+export const useBossStates       = () => useGameStore(s => s.bossStates);
+export const useLevelDef         = () => useGameStore(s => s.currentLevelDef);
+export const useIsPenaltyZone    = () =>
+  useGameStore(s => s.player?.isInPenaltyZone ?? false);
+export const useShopUnlocked     = () =>
+  useGameStore(s => s.dailyState.shopUnlocked);
+export const useIsLoading        = () => useGameStore(s => s.isLoading);
+export const useError            = () => useGameStore(s => s.error);
+export const useActivePenalty    = () => useGameStore(s => s.activePenaltyQuest);
+export const useCompletedTaskIds = () =>
+  useGameStore(s => s.dailyState.completedTaskIdsSet);
+export const usePenaltyProgress  = () =>
+  useGameStore(s => s.player?.penaltyQuestProgress ?? []);
